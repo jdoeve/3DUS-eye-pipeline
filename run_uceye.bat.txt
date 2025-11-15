@@ -1,0 +1,113 @@
+@echo off
+cls
+echo ========================================
+echo    UC-Eye Pipeline Launcher v1.1
+echo ========================================
+echo.
+
+cd /d "%~dp0"
+
+REM Find the pipeline script
+set PIPELINE_SCRIPT=
+if exist "uc_eye_pipeline.py" (
+    set PIPELINE_SCRIPT=uc_eye_pipeline.py
+) else if exist "uceye_pipeline.py" (
+    set PIPELINE_SCRIPT=uceye_pipeline.py
+) else if exist "pipeline.py" (
+    set PIPELINE_SCRIPT=pipeline.py
+) else (
+    for %%f in (*pipeline*.py) do (
+        set PIPELINE_SCRIPT=%%f
+        goto :found_script
+    )
+)
+
+:found_script
+if "%PIPELINE_SCRIPT%"=="" (
+    echo [ERROR] Pipeline script not found
+    echo Expected: uc_eye_pipeline.py, uceye_pipeline.py, or pipeline.py
+    pause
+    exit /b 1
+)
+
+echo [OK] Found pipeline: %PIPELINE_SCRIPT%
+
+REM Check for Python3
+where python >nul 2>nul
+if %errorlevel% neq 0 (
+    echo [ERROR] Python not installed or not in PATH
+    pause
+    exit /b 1
+)
+
+echo [OK] Python found
+echo.
+
+REM Check dependencies
+python -c "import numpy, cv2, SimpleITK" >nul 2>nul
+if %errorlevel% neq 0 (
+    echo Installing dependencies...
+    python -m pip install -r requirements.txt
+)
+
+echo.
+echo SELECT IMAGE FOLDER
+echo (You can drag and drop the folder into this window)
+echo Tip: Remove any quotes after pasting
+set /p "IMG_DIR_RAW=Image folder: "
+
+REM Remove surrounding quotes
+set "IMG_DIR=%IMG_DIR_RAW:"=%"
+
+REM Validate that path exists
+if not exist "%IMG_DIR%\" (
+    echo [ERROR] Directory not found
+    echo.
+    echo [DEBUG] Path provided: %IMG_DIR%
+    echo [DEBUG] Original input: %IMG_DIR_RAW%
+    echo.
+    echo Hint: Make sure to drag and drop the folder or type the full path
+    pause
+    exit /b 1
+)
+
+echo [OK] Found directory
+echo.
+
+echo SELECT MASK FILE
+echo (You can drag and drop the mask file into this window)
+set /p "MASK_PATH_RAW=Mask file: "
+
+REM Remove surrounding quotes
+set "MASK_PATH=%MASK_PATH_RAW:"=%"
+
+REM Validate that file exists
+if not exist "%MASK_PATH%" (
+    echo [ERROR] File not found: %MASK_PATH%
+    pause
+    exit /b 1
+)
+
+echo [OK] Found mask file
+echo.
+
+echo Starting pipeline...
+echo.
+
+REM Run the pipeline
+python "%PIPELINE_SCRIPT%" "%IMG_DIR%" "%MASK_PATH%"
+
+set EXIT_CODE=%errorlevel%
+
+echo.
+if %EXIT_CODE%==0 (
+    echo ========================================
+    echo    Pipeline completed successfully!
+    echo ========================================
+) else (
+    echo ========================================
+    echo    Pipeline failed with errors
+    echo ========================================
+)
+
+pause
