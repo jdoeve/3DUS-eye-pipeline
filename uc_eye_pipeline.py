@@ -42,6 +42,15 @@ DEFAULT_SIGMA_THETA_DEG = 1.0
 DEFAULT_INTERP_ORDER = 3
 DEFAULT_SLAB_SIZE = 48
 
+# ==== DEBUG FLAGS ====
+DEBUG_THETA_PHANTOM = False     # If True: each theta slice gets its index
+DEBUG_PHI_PHANTOM = False       # If True: each phi row gets its index
+DEBUG_RADIAL_PHANTOM = False    # If True: each r index gets its index
+
+DEBUG_BYPASS_MASK = False       # If True: skip mask_unwrapped entirely
+DEBUG_DUMP_MASK = False         # If True: save mask_unwrapped to disk
+# =====================
+
 # ==================== QC AND HELPER FUNCTIONS ====================
 
 def to_gray(img: np.ndarray) -> np.ndarray:
@@ -334,6 +343,11 @@ def load_numeric_sorted_images(folder: Path):
             files.extend(folder.glob(pat))
         except Exception as e:
             print(f"[WARNING] Error globbing {pat}: {e}")
+    if files:
+        filtered = [p for p in files if not p.name.startswith("._")]
+        if len(filtered) != len(files):
+            print(f"[INFO] Skipped {len(files) - len(filtered)} hidden resource files (._*)")
+        files = filtered
     if not files:
         print(f"[WARNING] No images found in: {folder}")
         try:
@@ -522,9 +536,23 @@ def unwrap_frames(imgs, geom: GeometryConfig, mask_path: Path,
         uw = cv2.remap(g, src_x, src_y,
                        interpolation=cv2.INTER_LINEAR,
                        borderMode=cv2.BORDER_CONSTANT, borderValue=0).astype(np.float32)
-        return uw * (mask_unwrapped > 0)
+        # Optional: dump unwrapped mask for debugging
+        if DEBUG_DUMP_MASK:
+            np.save("debug_mask_unwrapped.npy", (mask_unwrapped > 0).astype(np.uint8))
+
+        if DEBUG_BYPASS_MASK:
+            return uw
+        else:
+            return uw * (mask_unwrapped > 0)
 
     unwrapped = np.stack([unwrap_one(im) for im in imgs], axis=0).astype(np.float32)
+
+    if unwrapped.shape[0] >= 2:
+        first = unwrapped[0]
+        last = unwrapped[-1]
+        avg = 0.5 * (first + last)
+        unwrapped[0] = avg
+        unwrapped[-1] = avg
 
     # Drop duplicate final frame (Eye Cubed often repeats last)
     if drop_duplicate and unwrapped.shape[0] >= 2:
@@ -533,7 +561,7 @@ def unwrap_frames(imgs, geom: GeometryConfig, mask_path: Path,
         den = np.sqrt(((a - a.mean())**2).sum(dtype=np.float64) *
                       ((b - b.mean())**2).sum(dtype=np.float64)) + 1e-12
         corr = float(num / den)
-        if corr > 0.995:
+        if corr > 0.99:  # more tolerant threshold
             unwrapped = unwrapped[:-1]
             if verbose:
                 print(f"Dropped duplicate last frame (corr={corr:.4f})")
@@ -565,37 +593,6 @@ def register_frames(unwrapped, verbose: bool = True):
         print(f"Registered {N} frames to mid-frame reference")
     return unwrapped
 
-# ==================== GEOMETRIC VALIDATION (rough sphere check) ====================
-def validate_sphere_geometry(vol, voxel_mm, verbose=True):
-    center = np.array(vol.shape) // 2
-    search = vol[max(center[0]-10,0):center[0]+10,
-                 max(center[1]-10,0):center[1]+10,
-                 max(center[2]-10,0):center[2]+10]
-    if search.size == 0 or search.max() == 0:
-        if verbose:
-            print(f"[VALIDATION] No signal near volume center - cannot validate")
-        return [0, 0, 0]
-    local_peak = np.unravel_index(search.argmax(), search.shape)
-    peak_idx = (center[0] - 10 + local_peak[0],
-                center[1] - 10 + local_peak[1],
-                center[2] - 10 + local_peak[2])
-    thresh = vol[peak_idx] * 0.5
-    dims = []
-    for axis in range(3):
-        profile = (vol[:, peak_idx[1], peak_idx[2]] if axis == 0 else
-                   vol[peak_idx[0], :, peak_idx[2]] if axis == 1 else
-                   vol[peak_idx[0], peak_idx[1], :])
-        above = np.where(profile > thresh)[0]
-        dims.append(((above[-1] - above[0]) * voxel_mm) if len(above) else 0)
-    if verbose:
-        print(f"[VALIDATION] Sphere FWHM: "
-              f"X={dims[0]:.1f}mm, Y={dims[1]:.1f}mm, Z={dims[2]:.1f}mm")
-        vals = [d for d in dims if d > 0]
-        if len(vals) >= 2:
-            variation = np.std(vals) / np.mean(vals) * 100
-            print(f"[VALIDATION] Variation across axes: {variation:.1f}%")
-    return dims
-
 # ==================== RESAMPLING (polar to Cartesian 3D) ====================
 def resample_to_cartesian(unwrapped,
                           geom: GeometryConfig,
@@ -619,11 +616,24 @@ def resample_to_cartesian(unwrapped,
 
     # Re-order to V[r, phi, theta]
     V = np.transpose(unwrapped, (1, 2, 0)).astype(np.float32)
+    Rn, Wang_v, Ntheta = V.shape
+
+    # ==== DEBUG PHANTOMS: enable ONE at a time ====
+    if DEBUG_THETA_PHANTOM:
+        for k in range(Ntheta):
+            V[:, :, k] = float(k)
+    elif DEBUG_PHI_PHANTOM:
+        for j in range(Wang_v):
+            V[:, j, :] = float(j)
+    elif DEBUG_RADIAL_PHANTOM:
+        for i in range(Rn):
+            V[i, :, :] = float(i)
+    # ===============================================
 
     # (Optional) smooth along sweep axis (theta dimension)
     if sigma_theta_deg > 0:
-        sigma_samples = sigma_theta_deg * (N / 360.0)
-        V = gaussian_filter1d(V, sigma=sigma_samples, axis=2, mode='wrap')
+        sigma_theta = sigma_theta_deg * (Ntheta / 360.0)
+        V = gaussian_filter1d(V, sigma=sigma_theta, axis=2, mode='nearest')
 
     # We build a cube in mm of half_extent = depth_mm (sos-corrected).
     half_extent = depth_mm
@@ -633,9 +643,6 @@ def resample_to_cartesian(unwrapped,
     zs = np.linspace(-half_extent, half_extent, n_axis, dtype=np.float32)
 
     Nx = Ny = Nz = n_axis
-    Rn, Wang_v, Ntheta = V.shape
-
-    scale_theta = Ntheta / (2 * np.pi)
     prefilter = (interp_order >= 3)
 
     if verbose:
@@ -661,10 +668,12 @@ def resample_to_cartesian(unwrapped,
         r_cart = np.sqrt(xs_slab**2 + rho**2)
         phi_cart = np.arctan2(rho, xs_slab)  # [0, pi]
 
-        # theta angle around axis
+        # theta angle around axis (wrap to [0, 2π) to stay periodic)
         psi = np.broadcast_to(np.arctan2(Z2, Y2).astype(np.float32),
                               (x1 - x0, Ny, Nz))
-        theta_idx = (psi % (2 * np.pi)) * scale_theta
+        theta_wrapped = np.mod(psi, 2 * np.pi)
+        theta_idx = theta_wrapped * ((Ntheta - 1) / (2 * np.pi))
+        theta_idx = np.clip(theta_idx, 0.0, Ntheta - 1.0 - 1e-3)
 
         # valid mask: inside radial depth + inside fan
         valid = (r_cart <= depth_mm) & (phi_cart >= phi0) & (phi_cart <= phi1)
@@ -684,9 +693,9 @@ def resample_to_cartesian(unwrapped,
                 V,
                 coords,
                 order=interp_order,
-                mode='wrap',
+                mode='constant',
                 cval=0.0,
-                prefilter=prefilter
+                prefilter=prefilter,
             ).astype(np.float32)
 
             vol[x0 + idx_valid[0], idx_valid[1], idx_valid[2]] = sampled
@@ -1020,14 +1029,6 @@ def run_pipeline(img_dir: Path,
             slab_size,
             verbose=verbose
         )
-
-    # quick geometry sanity output (sphere-ish shape check)
-    with timer("Validation", verbose):
-        print("\n" + "=" * 60)
-        print("[INFO] Geometric validation using FWHM in mm")
-        # validate_sphere_geometry just uses voxel_mm for axis length calc.
-        validate_sphere_geometry(vol, voxel_mm, verbose)
-        print("=" * 60 + "\n")
 
     # ---------- Output path logic (supports --out-dir and iterative naming) ----------
     if output_path is None:
