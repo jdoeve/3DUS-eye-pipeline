@@ -926,7 +926,7 @@ def run_pipeline(img_dir: Path,
                  sigma_theta_deg: float = DEFAULT_SIGMA_THETA_DEG,
                  interp_order: int = DEFAULT_INTERP_ORDER,
                  slab_size: int = DEFAULT_SLAB_SIZE,
-                 do_registration: bool = False, # Change to False
+                 do_registration: bool = True,
                  drop_duplicate: bool = True,
                  verbose: bool = True,
                  out_dir_for_iter: Path | None = None):

@@ -1,0 +1,31 @@
+input_dir: "/Users/jeffreydoeve/Desktop/ARVO Data/Eyeball clockwise Phantom - Radial - OD - Primary - 11-13-2025 - 19-42/images"
+cone_mask: "/Users/jeffreydoeve/Desktop/3DUS-Eye/cone_mask_GIMP.png"
+out_dir: "/Users/jeffreydoeve/Desktop/ARVO Data/Eyeball clockwise Phantom - Radial - OD - Primary - 11-13-2025 - 19-42"
+
+depth_mm: 48.0
+voxel_mm: 0.15
+
+do_registration: true
+drop_duplicate: true
+
+raw:
+  enabled: true
+  sigma_theta_deg: 0.0
+  interp_order: 1
+  bit_depth: 16
+
+  smooth:
+  enabled: true
+  sigma_theta_deg: 0.7   # instead of 1.0–1.5; gentler smoothing
+  interp_order: 3        # cubic – keeps SMOOTH looking pretty
+  bit_depth: 8           # fine for visualization
+
+
+frames:
+  enabled: true      # << turn on horizontal export
+  axis: 2            # 0 = axial / horizontal planes
+  bit_depth: 16      # TIFFs at 16-bit for ImageJ
+  basename_raw: "RAW_slice"
+  basename_smooth: "SMOOTH_slice"
+
+
