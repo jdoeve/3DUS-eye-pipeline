@@ -38,9 +38,11 @@ FAN_ANGLE_RAD = np.deg2rad(EYE_CUBED_FAN_ANGLE_DEG)  # Fan angle in radians
 DEFAULT_DEPTH_MM = EYE_CUBED_DEPTH_MM
 DEFAULT_VOXEL_MM = 0.20  # Target voxel size for final output
 
-DEFAULT_SIGMA_THETA_DEG = 1.0
+DEFAULT_SIGMA_THETA_DEG = 2.5
 DEFAULT_INTERP_ORDER = 3
 DEFAULT_SLAB_SIZE = 48
+# Effective Theta span covered by entire scan (deg)
+DEFAULT_THETA_SPAN_DEG = 360.0
 
 # ==== DEBUG FLAGS ====
 DEBUG_THETA_PHANTOM = False     # If True: each theta slice gets its index
@@ -206,10 +208,39 @@ def qc_theta_even_odd(imgs, geom, mask_path, unwrap_fn, resample_fn, voxel_mm=0.
     idx_even = np.arange(0, N, 2)
     idx_odd  = np.arange(1, N, 2)
 
-    # Quick recons with coarse voxel size for speed
-    vol_all  = resample_fn(uw_all,           geom, voxel_mm, 0.0, 1, 48, verbose=False)
-    vol_even = resample_fn(uw_all[idx_even], geom, voxel_mm, 0.0, 1, 48, verbose=False)
-    vol_odd  = resample_fn(uw_all[idx_odd],  geom, voxel_mm, 0.0, 1, 48, verbose=False)
+    theta_span = DEFAULT_THETA_SPAN_DEG if "DEFAULT_THETA_SPAN_DEG" in globals() else 360.0
+
+   # Quick recons with coarse voxel size for speed
+    vol_all  = resample_fn(
+        uw_all,
+        geom,
+        voxel_mm,
+        sigma_theta_deg=0.0,
+        theta_span_deg=theta_span,
+        interp_order=1,
+        slab_size=48,
+        verbose=False,
+    )
+    vol_even = resample_fn(
+        uw_all[idx_even],
+        geom,
+        voxel_mm,
+        sigma_theta_deg=0.0,
+        theta_span_deg=theta_span,
+        interp_order=1,
+        slab_size=48,
+        verbose=False,
+    )
+    vol_odd  = resample_fn(
+        uw_all[idx_odd],
+        geom,
+        voxel_mm,
+        sigma_theta_deg=0.0,
+        theta_span_deg=theta_span,
+        interp_order=1,
+        slab_size=48,
+        verbose=False,
+    )
 
     ar_all  = pca_axis_ratio_of_volume(vol_all)
     ar_even = pca_axis_ratio_of_volume(vol_even)
@@ -264,21 +295,36 @@ class GeometryConfig:
         use_mask = (phi0_mask is not None) and (phi1_mask is not None)
 
         if use_mask:
-            self.phi0 = float(phi0_mask)
-            self.phi1 = float(phi1_mask)
+            # Start from mask-derived bounds
+            lo = float(phi0_mask)
+            hi = float(phi1_mask)
+            # Ensure lo < hi
+            if hi < lo:
+                lo, hi = hi, lo
+            # Shift so the lower bound is at 0 (no negative φ)
+            if lo < 0.0:
+                offset = -lo
+                lo += offset
+                hi += offset
+            self.phi0 = lo
+            self.phi1 = hi
             self.fan_angle_rad = self.phi1 - self.phi0
             self.fan_angle_deg = float(np.degrees(self.fan_angle_rad))
             fan_src = "mask"
         else:
+            # Device-spec fallback: define φ in [0, fan_angle]
             self.fan_angle_rad = spec_rad
             self.fan_angle_deg = EYE_CUBED_FAN_ANGLE_DEG
-            self.phi0 = -self.fan_angle_rad / 2
-            self.phi1 = +self.fan_angle_rad / 2
+            self.phi0 = 0.0
+            self.phi1 = self.fan_angle_rad
             fan_src = "spec"
 
         # KEY: Angular resolution (rad per pixel in lateral direction)
         # Use EFFECTIVE rows (usable mask span), not full image height
-        self.delta_phi_per_px = self.fan_angle_rad / float(self.image_height_eff - 1) if self.image_height_eff > 1 else self.fan_angle_rad
+        if self.image_height_eff > 1:
+            self.delta_phi_per_px = self.fan_angle_rad / float(self.image_height_eff - 1)
+        else:
+            self.delta_phi_per_px = self.fan_angle_rad
 
         # Radial resolution (mm per pixel in depth direction)
         self.dr_mm = self.depth_mm_sos_corrected / r_max_pix
@@ -547,24 +593,81 @@ def unwrap_frames(imgs, geom: GeometryConfig, mask_path: Path,
 
     unwrapped = np.stack([unwrap_one(im) for im in imgs], axis=0).astype(np.float32)
 
-    if unwrapped.shape[0] >= 2:
-        first = unwrapped[0]
-        last = unwrapped[-1]
-        avg = 0.5 * (first + last)
-        unwrapped[0] = avg
-        unwrapped[-1] = avg
+    # ------------------------------------------------------------------
+    # OPTIONAL: detect and repair a single "bad" theta frame that
+    # doesn't correlate with its neighbors (outlier in rotation).
+    # This directly targets the one-frame seam / jump you see in axial.
+    # ------------------------------------------------------------------
+    ENABLE_THETA_OUTLIER_FIX = True
+    OUTLIER_CORR_THRESHOLD = 0.90  # tune if needed
 
-    # Drop duplicate final frame (Eye Cubed often repeats last)
-    if drop_duplicate and unwrapped.shape[0] >= 2:
-        a, b = unwrapped[0], unwrapped[-1]
+    if ENABLE_THETA_OUTLIER_FIX and unwrapped.shape[0] >= 3:
+        N = unwrapped.shape[0]
+        # Correlation with previous and next frame for i = 1..N-2
+        corrs_prev = np.zeros(N, dtype=np.float32)
+        corrs_next = np.zeros(N, dtype=np.float32)
+
+        def frame_corr(a, b):
+            a = a.astype(np.float32)
+            b = b.astype(np.float32)
+            am = a.mean()
+            bm = b.mean()
+            num = ((a - am) * (b - bm)).sum(dtype=np.float64)
+            den = np.sqrt(((a - am) ** 2).sum(dtype=np.float64) *
+                          ((b - bm) ** 2).sum(dtype=np.float64)) + 1e-12
+            return float(num / den)
+
+        for i in range(1, N-1):
+            corrs_prev[i] = frame_corr(unwrapped[i], unwrapped[i-1])
+            corrs_next[i] = frame_corr(unwrapped[i], unwrapped[i+1])
+
+        # "Badness" = minimum correlation with neighbors
+        badness = np.minimum(corrs_prev, corrs_next)
+        # Ignore first/last (we handle them separately)
+        candidate_idx = np.arange(1, N-1)
+        candidate_badness = badness[1:N-1]
+
+        # Find the worst frame among internal indices
+        worst_i = candidate_idx[np.argmin(candidate_badness)]
+        worst_val = candidate_badness.min()
+
+        if worst_val < OUTLIER_CORR_THRESHOLD:
+            # Replace this frame with the average of its neighbors
+            if verbose:
+                print(f"[unwrap] Theta outlier at index {worst_i} "
+                      f"(min corr={worst_val:.3f}); replacing with neighbor average.")
+            unwrapped[worst_i] = 0.5 * (unwrapped[worst_i-1] + unwrapped[worst_i+1])
+        elif verbose:
+            print(f"[unwrap] No theta outlier detected (min neighbor corr={worst_val:.3f}).")
+# ------------------------------------------------------------------
+
+
+    # Handle potential duplicate last frame carefully.
+    # Only average/drop if the first and last are truly almost identical.
+    if unwrapped.shape[0] >= 2:
+        a = unwrapped[0]
+        b = unwrapped[-1]
         num = ((a - a.mean()) * (b - b.mean())).sum(dtype=np.float64)
         den = np.sqrt(((a - a.mean())**2).sum(dtype=np.float64) *
                       ((b - b.mean())**2).sum(dtype=np.float64)) + 1e-12
         corr = float(num / den)
-        if corr > 0.99:  # more tolerant threshold
-            unwrapped = unwrapped[:-1]
+
+        if corr > 0.99:
+            # True duplicate: make them consistent and optionally drop the last.
+            avg = 0.5 * (a + b)
+            unwrapped[0]  = avg
+            unwrapped[-1] = avg
+            if drop_duplicate:
+                unwrapped = unwrapped[:-1]
             if verbose:
-                print(f"Dropped duplicate last frame (corr={corr:.4f})")
+                print(f"[unwrap] First/last correlation {corr:.4f} → treated as duplicate, "
+                      f"{'dropped last frame' if drop_duplicate else 'kept both averaged'}.")
+        else:
+            # Not a duplicate: keep as distinct angles, do NOT average or drop.
+            if verbose:
+                print(f"[unwrap] First/last correlation {corr:.4f} → distinct angles; "
+                      "no averaging or drop applied.")
+
     return unwrapped, mask_unwrapped
 
 # ==================== REGISTRATION ====================
@@ -583,28 +686,56 @@ def estimate_phi_shift_1d(ref_uw, mov_uw):
     return k
 
 def register_frames(unwrapped, verbose: bool = True):
+    """
+    Rigidly register unwrapped frames along the φ axis to a mid-frame reference.
+
+    Returns
+    -------
+    unwrapped_reg : np.ndarray
+        Registered unwrapped stack, same shape as input.
+    phi_shifts : np.ndarray of shape (N,)
+        Integer pixel shifts applied to each frame (φ-direction).
+        Positive shift means the frame was rolled forward along +φ.
+    """
     N = unwrapped.shape[0]
     ref = unwrapped[N // 2]
+    phi_shifts = np.zeros(N, dtype=np.int32)
+
     for k in range(N):
         sh = estimate_phi_shift_1d(ref, unwrapped[k])
+        phi_shifts[k] = sh
         if sh:
             unwrapped[k] = np.roll(unwrapped[k], shift=sh, axis=1)
+
     if verbose:
         print(f"Registered {N} frames to mid-frame reference")
-    return unwrapped
+        print(f"[register] φ-shift range: {phi_shifts.min()}..{phi_shifts.max()} px")
+
+    return unwrapped, phi_shifts
 
 # ==================== RESAMPLING (polar to Cartesian 3D) ====================
 def resample_to_cartesian(unwrapped,
                           geom: GeometryConfig,
                           voxel_mm: float,
                           sigma_theta_deg: float,
+                          theta_span_deg: float,
                           interp_order: int,
                           slab_size: int,
+                          theta_k=None,
                           verbose: bool = True):
+  
     """
     Map the unwrapped polar data (r,phi,theta) into a Cartesian volume.
     Uses centralized GeometryConfig for all geometric parameters.
+
+    Parameters
+    ----------
+    theta_k : np.ndarray or None
+        Optional array of per-frame angles in radians (length Ntheta), typically
+        built from frame index plus φ-based registration shifts. If None, a
+        uniform theta grid over [0, theta_span_deg] is assumed (legacy behaviour).
     """
+
     N, R, Wang = unwrapped.shape
 
     # All geometry comes from GeometryConfig (single source of truth)
@@ -617,6 +748,25 @@ def resample_to_cartesian(unwrapped,
     # Re-order to V[r, phi, theta]
     V = np.transpose(unwrapped, (1, 2, 0)).astype(np.float32)
     Rn, Wang_v, Ntheta = V.shape
+
+    # Prepare theta grid → frame index mapping
+    if theta_k is not None:
+        theta_k = np.asarray(theta_k, dtype=np.float32)
+        if theta_k.shape[0] != Ntheta:
+            raise ValueError(f"theta_k length {theta_k.shape[0]} does not match Ntheta {Ntheta}")
+        # Ensure non-decreasing (allow tiny numerical noise)
+        if np.any(np.diff(theta_k) < -1e-5):
+            theta_k = np.sort(theta_k)
+        theta_min = float(theta_k[0])
+        theta_max = float(theta_k[-1])
+    else:
+        # Legacy: assume uniform sampling over requested theta_span_deg
+        theta_min = 0.0
+        theta_max = np.deg2rad(theta_span_deg)
+        theta_k = np.linspace(theta_min, theta_max, Ntheta, dtype=np.float32)
+
+    frame_idx_array = np.arange(Ntheta, dtype=np.float32)
+    theta_span_rad_eff = max(theta_max - theta_min, 1e-6)
 
     # ==== DEBUG PHANTOMS: enable ONE at a time ====
     if DEBUG_THETA_PHANTOM:
@@ -632,7 +782,9 @@ def resample_to_cartesian(unwrapped,
 
     # (Optional) smooth along sweep axis (theta dimension)
     if sigma_theta_deg > 0:
-        sigma_theta = sigma_theta_deg * (Ntheta / 360.0)
+        # Convert degrees of smoothing to index units using the requested sweep span.
+        # Example: if Ntheta=400 and theta_span_deg=240, then 1° ≈ (399/240) indices.
+        sigma_theta = sigma_theta_deg * ((Ntheta - 1) / max(theta_span_deg, 1e-3))
         V = gaussian_filter1d(V, sigma=sigma_theta, axis=2, mode='nearest')
 
     # We build a cube in mm of half_extent = depth_mm (sos-corrected).
@@ -661,6 +813,7 @@ def resample_to_cartesian(unwrapped,
     for s in range(n_slabs):
         x0 = s * slab_size
         x1 = min((s + 1) * slab_size, Nx)
+      
         xs_slab = xs[x0:x1][:, None, None]
 
         # Convert each Cartesian sample point to source polar indices
@@ -671,9 +824,13 @@ def resample_to_cartesian(unwrapped,
         # theta angle around axis (wrap to [0, 2π) to stay periodic)
         psi = np.broadcast_to(np.arctan2(Z2, Y2).astype(np.float32),
                               (x1 - x0, Ny, Nz))
+
+        # Wrap ψ into [0, 2π)
         theta_wrapped = np.mod(psi, 2 * np.pi)
-        theta_idx = theta_wrapped * ((Ntheta - 1) / (2 * np.pi))
-        theta_idx = np.clip(theta_idx, 0.0, Ntheta - 1.0 - 1e-3)
+
+        # Map global angle into scanner's effective sweep [theta_min, theta_max]
+        # (We assume the seam is aligned with ψ=0, as before.)
+        theta_virtual = (theta_wrapped / (2 * np.pi)) * theta_span_rad_eff + theta_min
 
         # valid mask: inside radial depth + inside fan
         valid = (r_cart <= depth_mm) & (phi_cart >= phi0) & (phi_cart <= phi1)
@@ -686,7 +843,12 @@ def resample_to_cartesian(unwrapped,
         if idx_valid[0].size:
             r_idx_v = np.clip(r_idx[idx_valid], 0, Rn - 1 - 1e-3).astype(np.float32)
             phi_idx_v = np.clip(phi_idx[idx_valid], 0, Wang_v - 1 - 1e-3).astype(np.float32)
-            theta_idx_v = theta_idx[idx_valid].astype(np.float32)
+
+            theta_virtual_v = theta_virtual[idx_valid].astype(np.float32)
+            # Interpolate global angle to fractional frame index
+            theta_idx_v = np.interp(theta_virtual_v, theta_k, frame_idx_array)
+            theta_idx_v = np.clip(theta_idx_v, 0.0, Ntheta - 1.0 - 1e-3)
+
             coords = np.vstack([r_idx_v, phi_idx_v, theta_idx_v])
 
             sampled = map_coordinates(
@@ -924,6 +1086,7 @@ def run_pipeline(img_dir: Path,
                  depth_mm: float = DEFAULT_DEPTH_MM,
                  voxel_mm: float = DEFAULT_VOXEL_MM,
                  sigma_theta_deg: float = DEFAULT_SIGMA_THETA_DEG,
+                 theta_span_deg: float = DEFAULT_THETA_SPAN_DEG,
                  interp_order: int = DEFAULT_INTERP_ORDER,
                  slab_size: int = DEFAULT_SLAB_SIZE,
                  do_registration: bool = True,
@@ -1004,9 +1167,30 @@ def run_pipeline(img_dir: Path,
         if verbose:
             print(f"  Unwrapped shape: {unwrapped.shape} (N, r, phi)")
 
+    # --- Build per-frame theta mapping (θ_k) in radians ---
+    Ntheta = unwrapped.shape[0]
+    theta_span_rad = np.deg2rad(theta_span_deg)
+    # Baseline: assume uniform sampling over requested sweep
+    theta_k = np.linspace(0.0, theta_span_rad, Ntheta, dtype=np.float32)
+
     if do_registration:
         with timer("Register φ across frames", verbose):
-            unwrapped = register_frames(unwrapped, verbose=verbose)
+            unwrapped, phi_shifts = register_frames(unwrapped, verbose=verbose)
+
+        # Convert φ pixel shifts to small angular corrections in θ (radians).
+        # Each φ pixel corresponds to Δφ radians; rolling the image by +sh pixels
+        # means the original frame was rotated by about -sh * Δφ.
+        dphi = geom.delta_phi_per_px  # rad/px along φ
+        delta_theta = -phi_shifts.astype(np.float32) * dphi
+
+        theta_k = theta_k + delta_theta
+
+        # Renormalize θ_k back to [0, theta_span_rad] while preserving ordering.
+        theta_k -= theta_k.min()
+        max_span = max(theta_k.max(), 1e-6)
+        theta_k *= theta_span_rad / max_span
+    else:
+        phi_shifts = np.zeros(Ntheta, dtype=np.int32)
 
     # QC: Segmentation bias check (2D)
     if verbose:
@@ -1025,8 +1209,10 @@ def run_pipeline(img_dir: Path,
             geom,
             voxel_mm,
             sigma_theta_deg,
+            theta_span_deg,
             interp_order,
             slab_size,
+            theta_k=theta_k,
             verbose=verbose
         )
 
@@ -1099,6 +1285,8 @@ def main():
                         help="Target mm/voxel in output (lateral mm/pixel calibration)")
     parser.add_argument("--sigma-theta", type=float, default=DEFAULT_SIGMA_THETA_DEG,
                         help="Smoothing (deg) around sweep axis")
+    parser.add_argument("--theta-span-deg", type=float, default=DEFAULT_THETA_SPAN_DEG,
+                        help="Effective θ sweep span in degrees (tune with phantom to reduce kink)")
     parser.add_argument("--interp-order", type=int, default=DEFAULT_INTERP_ORDER,
                         help="Interpolation order for map_coordinates (0..5)")
     parser.add_argument("--slab-size", type=int, default=DEFAULT_SLAB_SIZE,
@@ -1128,6 +1316,7 @@ def main():
             depth_mm=args.depth,
             voxel_mm=args.voxel,
             sigma_theta_deg=args.sigma_theta,
+            theta_span_deg=args.theta_span_deg,
             interp_order=args.interp_order,
             slab_size=args.slab_size,
             do_registration=not args.no_register,
