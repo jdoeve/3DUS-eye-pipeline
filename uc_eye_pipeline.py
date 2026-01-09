@@ -36,11 +36,12 @@ FAN_ANGLE_RAD = np.deg2rad(EYE_CUBED_FAN_ANGLE_DEG)  # Fan angle in radians
 
 # ==================== CONFIGURATION ====================
 DEFAULT_DEPTH_MM = EYE_CUBED_DEPTH_MM
-DEFAULT_VOXEL_MM = 0.20  # Target voxel size for final output
+DEFAULT_VOXEL_MM = 0.20  
 
-DEFAULT_SIGMA_THETA_DEG = 2.5
-DEFAULT_INTERP_ORDER = 3
-DEFAULT_SLAB_SIZE = 48
+DEFAULT_SIGMA_THETA_DEG = 0.0 #2.5
+DEFAULT_INTERP_ORDER = 1 
+DEFAULT_SLAB_SIZE = 48 #24
+
 # Effective Theta span covered by entire scan (deg)
 DEFAULT_THETA_SPAN_DEG = 360.0
 
@@ -51,6 +52,8 @@ DEBUG_RADIAL_PHANTOM = False    # If True: each r index gets its index
 
 DEBUG_BYPASS_MASK = False       # If True: skip mask_unwrapped entirely
 DEBUG_DUMP_MASK = False         # If True: save mask_unwrapped to disk
+
+DO_QC = False
 # =====================
 
 # ==================== QC AND HELPER FUNCTIONS ====================
@@ -255,6 +258,129 @@ def qc_theta_even_odd(imgs, geom, mask_path, unwrap_fn, resample_fn, voxel_mm=0.
         else:
             print("[QC-θ] OK (≤2%).")
     return ar_all, ar_even, ar_odd
+
+def _roi_for_similarity(unwrapped: np.ndarray, geom, depth_mm_lo=15.0, depth_mm_hi=35.0):
+    """
+    Pick a radial band [depth_mm_lo, depth_mm_hi] to reduce speckle sensitivity.
+    Returns slice object for r-index.
+    """
+    r0 = int(np.clip(round(depth_mm_lo / geom.dr_mm), 0, unwrapped.shape[1]-1))
+    r1 = int(np.clip(round(depth_mm_hi / geom.dr_mm), r0+1, unwrapped.shape[1]))
+    return slice(r0, r1)
+
+def _adjacent_corr_score(A: np.ndarray, B: np.ndarray) -> float:
+    """
+    Correlation score between two 2D arrays (float32). Robust enough + fast.
+    """
+    A = A.astype(np.float32, copy=False)
+    B = B.astype(np.float32, copy=False)
+    Am = float(A.mean()); Bm = float(B.mean())
+    num = float(((A - Am) * (B - Bm)).sum(dtype=np.float64))
+    den = float(np.sqrt(((A - Am)**2).sum(dtype=np.float64) * ((B - Bm)**2).sum(dtype=np.float64)) + 1e-12)
+    return num / den
+
+def find_best_cut(unwrapped: np.ndarray, geom,
+                  depth_mm_lo=15.0, depth_mm_hi=35.0,
+                  phi_stride=4, ignore_margin=2) -> tuple[int, float]:
+    """
+    Find k in [1..N-1] where corr(frame[k-1], frame[k]) is maximal (within ROI).
+    Rolling by -k moves that boundary to the wrap point, minimizing seam.
+    """
+    N = unwrapped.shape[0]
+    if N < 6:
+        return 0, -1.0
+
+    r_sl = _roi_for_similarity(unwrapped, geom, depth_mm_lo, depth_mm_hi)
+
+    # Downsample phi for speed / robustness (optional)
+    # ROI shape: (r_band, phi)
+    best_k = 0
+    best_score = -1e9
+
+    for k in range(1, N):
+        if k < ignore_margin or k > (N - ignore_margin):
+            continue
+        A = unwrapped[k-1, r_sl, ::phi_stride]
+        B = unwrapped[k,   r_sl, ::phi_stride]
+        s = _adjacent_corr_score(A, B)
+        if s > best_score:
+            best_score = s
+            best_k = k
+
+    return best_k, float(best_score)
+
+def apply_circular_shift_best_cut(unwrapped: np.ndarray, theta_k: np.ndarray, phi_shifts: np.ndarray, k: int, theta_span_rad: float, verbose: bool = True):
+    if k == 0:
+        if verbose:
+            print("[best-cut] k=0, no circular shift applied.")
+        return unwrapped, theta_k.astype(np.float32, copy=False), phi_shifts.astype(np.int32, copy=False)
+
+    if verbose:
+        print(f"[best-cut] Applying circular shift by {-k} (cut at k={k}).")
+
+    unwrapped2 = np.roll(unwrapped, shift=-k, axis=0)
+    theta2     = np.roll(theta_k,  shift=-k).astype(np.float64)   # do unwrap in float64
+    phi2       = np.roll(phi_shifts, shift=-k).astype(np.int32)
+
+    # 1) unwrap → strictly increasing in continuous radians
+    theta2 = np.unwrap(theta2)
+
+    # 2) normalize to start at 0
+    theta2 -= theta2.min()
+
+    # 3) scale to exactly [0, theta_span_rad]
+    span = float(theta2.max() - theta2.min())
+    if span < 1e-6:
+        # fallback: uniform theta if something went wrong
+        if verbose:
+            print("[best-cut] WARNING: theta span collapsed; falling back to uniform theta grid.")
+        N = theta2.size
+        theta2 = np.linspace(0.0, theta_span_rad, N, endpoint=False, dtype=np.float64)
+    else:
+        theta2 *= (float(theta_span_rad) / span)
+
+    # 4) final strict monotonic safety (float32 can introduce equal neighbors)
+    theta2 = theta2.astype(np.float32)
+    eps = 1e-6
+    for i in range(1, theta2.size):
+        if theta2[i] <= theta2[i-1]:
+            theta2[i] = theta2[i-1] + eps
+
+    if verbose:
+        print(f"[best-cut] theta_k after unwrap: min={float(theta2.min()):.6f} "
+              f"max={float(theta2.max()):.6f} span={float(theta2.max()-theta2.min()):.6f} "
+              f"noninc={bool(np.any(np.diff(theta2) <= 0))}")
+
+    return unwrapped2, theta2, phi2
+
+def closure_blend(unwrapped: np.ndarray, K: int = 5, verbose=True) -> np.ndarray:
+    """
+    Cosine-taper blend last K frames into first K frames. Local-only seam reduction.
+    """
+    if K <= 0:
+        return unwrapped
+    N = unwrapped.shape[0]
+    if 2*K >= N:
+        if verbose:
+            print("[blend] K too large for N; skipping blend.")
+        return unwrapped
+
+    # weights go 0→1 across K frames
+    t = np.linspace(0, 1, K, endpoint=False, dtype=np.float32)
+    w = 0.5 - 0.5*np.cos(np.pi * t)  # cosine ramp in [0,1)
+
+    out = unwrapped.copy()
+    # Blend pairs: end frames mix into start frames
+    for i in range(K):
+        a = out[N-K+i]     # tail
+        b = out[i]         # head
+        wi = float(w[i])
+        out[i]       = (1.0-wi)*b + wi*a
+        out[N-K+i]   = (1.0-wi)*a + wi*b
+
+    if verbose:
+        print(f"[blend] Applied closure blend with K={K}.")
+    return out
 
 # ==================== GEOMETRY CONFIGURATION (SINGLE SOURCE OF TRUTH) ====================
 class GeometryConfig:
@@ -749,14 +875,23 @@ def resample_to_cartesian(unwrapped,
     V = np.transpose(unwrapped, (1, 2, 0)).astype(np.float32)
     Rn, Wang_v, Ntheta = V.shape
 
+    # Ensure V is contiguous and float32 for fast sampling
+    V = np.ascontiguousarray(V, dtype=np.float32)
+
     # Prepare theta grid → frame index mapping
     if theta_k is not None:
         theta_k = np.asarray(theta_k, dtype=np.float32)
         if theta_k.shape[0] != Ntheta:
             raise ValueError(f"theta_k length {theta_k.shape[0]} does not match Ntheta {Ntheta}")
-        # Ensure non-decreasing (allow tiny numerical noise)
-        if np.any(np.diff(theta_k) < -1e-5):
-            theta_k = np.sort(theta_k)
+        def make_strictly_increasing(tk: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+            out = tk.astype(np.float32, copy=True)
+            for i in range(1, out.size):
+                if out[i] <= out[i-1]:
+                    out[i] = out[i-1] + eps
+            return out
+
+        theta_k = make_strictly_increasing(theta_k)
+
         theta_min = float(theta_k[0])
         theta_max = float(theta_k[-1])
     else:
@@ -768,10 +903,18 @@ def resample_to_cartesian(unwrapped,
     frame_idx_array = np.arange(Ntheta, dtype=np.float32)
     theta_span_rad_eff = max(theta_max - theta_min, 1e-6)
 
+    print("theta_k last 5:", theta_k[-5:])
+    print("diff last 5:", np.diff(theta_k[-5:]))
+    print("any non-increasing:", np.any(np.diff(theta_k) <= 0))
+
     # ==== DEBUG PHANTOMS: enable ONE at a time ====
     if DEBUG_THETA_PHANTOM:
+        # Periodic theta phantom: intensity = (cos(theta)+1)/2
+        # This ensures value at 0° equals value at 360° (no inherent jump).
+        theta_vals = np.linspace(0.0, 2.0*np.pi, Ntheta, endpoint=False, dtype=np.float32)
+        cos_vals = 0.5 * (np.cos(theta_vals) + 1.0)  # range ~[0,1]
         for k in range(Ntheta):
-            V[:, :, k] = float(k)
+            V[:, :, k] = cos_vals[k]
     elif DEBUG_PHI_PHANTOM:
         for j in range(Wang_v):
             V[:, j, :] = float(j)
@@ -780,12 +923,26 @@ def resample_to_cartesian(unwrapped,
             V[i, :, :] = float(i)
     # ===============================================
 
+    # ---- Patch 2: make theta periodic for interpolation (close the loop) ----
+    # Add a duplicate of theta=0 as the last theta slice so 2π blends with 0.
+    V = np.concatenate([V, V[:, :, 0:1]], axis=2)
+    Rn, Wang_v, Ntheta = V.shape  # Ntheta is now original+1
+    # ------------------------------------------------------------------------
+
+    # Make theta_k and frame_idx_array match the new theta length (Ntheta = Norig+1)
+    theta_k = np.concatenate([theta_k, [theta_k[0] + theta_span_rad_eff]]).astype(np.float32)
+    frame_idx_array = np.arange(Ntheta, dtype=np.float32)
+
+    sigma_theta = 0.0  # default (no smoothing)
+    did_smooth = False
+
     # (Optional) smooth along sweep axis (theta dimension)
     if sigma_theta_deg > 0:
+        did_smooth = True
         # Convert degrees of smoothing to index units using the requested sweep span.
         # Example: if Ntheta=400 and theta_span_deg=240, then 1° ≈ (399/240) indices.
         sigma_theta = sigma_theta_deg * ((Ntheta - 1) / max(theta_span_deg, 1e-3))
-        V = gaussian_filter1d(V, sigma=sigma_theta, axis=2, mode='nearest')
+        V = gaussian_filter1d(V, sigma=sigma_theta, axis=2, mode='wrap')
 
     # We build a cube in mm of half_extent = depth_mm (sos-corrected).
     half_extent = depth_mm
@@ -806,31 +963,59 @@ def resample_to_cartesian(unwrapped,
         
     # Cartesian sampling grid
     Y2, Z2 = np.meshgrid(ys, zs, indexing='ij')
+    rho2d = np.sqrt(Y2**2 + Z2**2).astype(np.float32)          # (Ny, Nz)
+    psi2d = np.arctan2(Z2, Y2).astype(np.float32)              # (Ny, Nz)
+    psi2d = np.mod(psi2d, 2*np.pi).astype(np.float32)          # [0, 2π)
+
+    # --- NEW: rotate branch cut away from voxel grid (half-bin offset) ---
+    psi_offset = np.pi/2
+    psi2d = np.mod(psi2d + psi_offset, 2*np.pi).astype(np.float32)
+
     vol = np.zeros((Nx, Ny, Nz), dtype=np.float32)
     n_slabs = int(np.ceil(Nx / slab_size))
+    coords_buf = None   # reusable buffer for map_coordinates
     t0 = time.time()
 
+    # --- Optimization 2: find slab bounds with any valid voxels (cheap probe) ---
+    first_valid_s = None
+    last_valid_s = None
+
     for s in range(n_slabs):
+        x0 = s * slab_size
+        x1 = min((s + 1) * slab_size, Nx)
+        xs_slab = xs[x0:x1][:, None, None]
+
+        # Compute only what is needed for validity (cheap)
+        rho = rho2d[None, :, :]  # cheap view
+        r_cart = np.sqrt(xs_slab**2 + rho**2)
+        phi_cart = np.arctan2(rho, xs_slab)  # [0, pi]
+
+        valid = (r_cart <= depth_mm) & (phi_cart >= phi0) & (phi_cart <= phi1)
+        n_valid = int(np.count_nonzero(valid))
+
+        if n_valid > 0:
+            if first_valid_s is None:
+                first_valid_s = s
+            last_valid_s = s
+
+    # IMPORTANT: this check must be AFTER the probe loop
+    if first_valid_s is None:
+        return vol
+# -------------------------------------------------------------------------
+    processed = 0
+    total_work_slabs = (last_valid_s - first_valid_s + 1)
+
+    for s in range(first_valid_s, last_valid_s + 1):
+        processed += 1
         x0 = s * slab_size
         x1 = min((s + 1) * slab_size, Nx)
       
         xs_slab = xs[x0:x1][:, None, None]
 
         # Convert each Cartesian sample point to source polar indices
-        rho = np.sqrt(Y2[None, :, :]**2 + Z2[None, :, :]**2)
+        rho = rho2d[None, :, :]  # cheap view
         r_cart = np.sqrt(xs_slab**2 + rho**2)
         phi_cart = np.arctan2(rho, xs_slab)  # [0, pi]
-
-        # theta angle around axis (wrap to [0, 2π) to stay periodic)
-        psi = np.broadcast_to(np.arctan2(Z2, Y2).astype(np.float32),
-                              (x1 - x0, Ny, Nz))
-
-        # Wrap ψ into [0, 2π)
-        theta_wrapped = np.mod(psi, 2 * np.pi)
-
-        # Map global angle into scanner's effective sweep [theta_min, theta_max]
-        # (We assume the seam is aligned with ψ=0, as before.)
-        theta_virtual = (theta_wrapped / (2 * np.pi)) * theta_span_rad_eff + theta_min
 
         # valid mask: inside radial depth + inside fan
         valid = (r_cart <= depth_mm) & (phi_cart >= phi0) & (phi_cart <= phi1)
@@ -840,31 +1025,55 @@ def resample_to_cartesian(unwrapped,
         phi_idx = (phi_cart - phi0) / dphi
 
         idx_valid = np.where(valid)
+
+        if verbose:
+            print(f"[Slab {s+1}/{n_slabs}] n_valid={idx_valid[0].size}")
+
+        if idx_valid[0].size == 0:
+            continue
+
         if idx_valid[0].size:
             r_idx_v = np.clip(r_idx[idx_valid], 0, Rn - 1 - 1e-3).astype(np.float32)
             phi_idx_v = np.clip(phi_idx[idx_valid], 0, Wang_v - 1 - 1e-3).astype(np.float32)
 
-            theta_virtual_v = theta_virtual[idx_valid].astype(np.float32)
+            psi_v = psi2d[idx_valid[1], idx_valid[2]]  # depends only on (y,z)
+            theta_virtual_v = (psi_v / (2*np.pi)) * theta_span_rad_eff + theta_min
+            theta_virtual_v = theta_virtual_v.astype(np.float32, copy=False)
+
             # Interpolate global angle to fractional frame index
             theta_idx_v = np.interp(theta_virtual_v, theta_k, frame_idx_array)
-            theta_idx_v = np.clip(theta_idx_v, 0.0, Ntheta - 1.0 - 1e-3)
+            theta_idx_v = np.clip(theta_idx_v, 0.0, (Ntheta - 1.0) - 1e-6)
 
-            coords = np.vstack([r_idx_v, phi_idx_v, theta_idx_v])
+            # >>> ADD THIS BLOCK RIGHT HERE <<<
+            if DEBUG_THETA_PHANTOM and processed == 1:  # first slab only
+                print("theta_idx_v min/max:", float(theta_idx_v.min()), float(theta_idx_v.max()))
+                print("frac near 0:", float(np.mean(theta_idx_v < 1.0)))
+                print("frac near end:", float(np.mean(theta_idx_v > (Ntheta - 2.0))))
+
+            n = r_idx_v.size
+            if coords_buf is None or coords_buf.shape[1] < n:
+                coords_buf = np.empty((3, n), dtype=np.float32)
+
+            coords_buf[0, :n] = r_idx_v
+            coords_buf[1, :n] = phi_idx_v
+            coords_buf[2, :n] = theta_idx_v
+            coords = coords_buf[:, :n]
 
             sampled = map_coordinates(
                 V,
                 coords,
                 order=interp_order,
-                mode='constant',
-                cval=0.0,
+                mode='nearest',
                 prefilter=prefilter,
             ).astype(np.float32)
 
             vol[x0 + idx_valid[0], idx_valid[1], idx_valid[2]] = sampled
 
         elapsed = time.time() - t0
-        print(f"  Slab {s+1:2d}/{n_slabs} | Elapsed {fmt_t(elapsed)} | "
-              f"ETA {fmt_t((elapsed/(s+1))*(n_slabs-(s+1)))}")
+        if verbose:
+            remaining = total_work_slabs - processed
+            eta = (elapsed / max(processed, 1)) * remaining
+            print(f"  Slab {processed:2d}/{total_work_slabs} | Elapsed {fmt_t(elapsed)} | ETA {fmt_t(eta)}")
 
     return vol
 
@@ -1145,11 +1354,12 @@ def run_pipeline(img_dir: Path,
     if verbose:
         geom.print_summary()
 
-    # QC: Row-arc check
-    if verbose:
-        with timer("QC: Row-arc vs mask", verbose):
-            mask_gray = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
-            qc_row_arc_against_mask(imgs[len(imgs)//2], geom, mask_gray, depths_mm=(10,20,30,40), verbose=verbose)
+    if DO_QC:
+        # QC: Row-arc check
+        if verbose:
+            with timer("QC: Row-arc vs mask", verbose):
+                mask_gray = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+                qc_row_arc_against_mask(imgs[len(imgs)//2], geom, mask_gray, depths_mm=(10,20,30,40), verbose=verbose)
 
     # Apex micro-search for optimal alignment
     with timer("Apex micro-search", verbose):
@@ -1170,8 +1380,13 @@ def run_pipeline(img_dir: Path,
     # --- Build per-frame theta mapping (θ_k) in radians ---
     Ntheta = unwrapped.shape[0]
     theta_span_rad = np.deg2rad(theta_span_deg)
-    # Baseline: assume uniform sampling over requested sweep
-    theta_k = np.linspace(0.0, theta_span_rad, Ntheta, dtype=np.float32)
+    theta_k = np.linspace(
+        0.0,
+        theta_span_rad,
+        Ntheta,
+        endpoint=False,   # <<< CRITICAL FIX
+        dtype=np.float32)
+
 
     if do_registration:
         with timer("Register φ across frames", verbose):
@@ -1192,15 +1407,54 @@ def run_pipeline(img_dir: Path,
     else:
         phi_shifts = np.zeros(Ntheta, dtype=np.int32)
 
-    # QC: Segmentation bias check (2D)
-    if verbose:
-        with timer("Segmentation bias check (2D)", verbose):
-            _ = compare_edge_vs_threshold_radius(unwrapped, geom, depth_mm=24.0, verbose=verbose)
+    # ==================== SEAM ROBUSTNESS (REAL DATA) ====================
+    ENABLE_BEST_CUT_SHIFT = True
+    ENABLE_CLOSURE_BLEND  = True
+    BLEND_K = 5  # start with 5; tune 3–7
 
-    # QC: Rotation uniformity (even/odd subsets)
+    # (Optional) measure closure corr before
+    r_sl = _roi_for_similarity(unwrapped, geom, depth_mm_lo=15.0, depth_mm_hi=35.0)
+    closure_before = _adjacent_corr_score(unwrapped[-1, r_sl, ::4], unwrapped[0, r_sl, ::4])
     if verbose:
-        with timer("QC: rotation even/odd", verbose):
-            _ = qc_theta_even_odd(imgs, geom, mask_path, unwrap_frames, resample_to_cartesian, voxel_mm=0.30, verbose=verbose)
+        print(f"[seam] closure corr BEFORE shift/blend: {closure_before:.4f}")
+
+    if ENABLE_BEST_CUT_SHIFT:
+        k_cut, k_score = find_best_cut(
+            unwrapped, geom,
+            depth_mm_lo=15.0, depth_mm_hi=35.0,
+            phi_stride=4,
+            ignore_margin=2
+        )
+        if verbose:
+            print(f"[seam] best cut k={k_cut} with adjacent corr={k_score:.4f}")
+
+        unwrapped, theta_k, phi_shifts = apply_circular_shift_best_cut(
+            unwrapped, theta_k, phi_shifts, k_cut, theta_span_rad, verbose=verbose
+            )
+
+    if ENABLE_CLOSURE_BLEND:
+        unwrapped = closure_blend(unwrapped, K=BLEND_K, verbose=verbose)
+
+    # measure closure corr after
+    closure_after = _adjacent_corr_score(unwrapped[-1, r_sl, ::4], unwrapped[0, r_sl, ::4])
+    if verbose:
+        print(f"[seam] closure corr AFTER shift/blend: {closure_after:.4f}")
+# ======================================================
+
+    if DO_QC:
+        # QC: Segmentation bias check (2D)
+        if verbose:
+            with timer("Segmentation bias check (2D)", verbose):
+                _ = compare_edge_vs_threshold_radius(unwrapped, geom, depth_mm=24.0, verbose=verbose)
+
+        # QC: Rotation uniformity (even/odd subsets)
+        if verbose:
+            with timer("QC: rotation even/odd", verbose):
+                _ = qc_theta_even_odd(imgs, geom, mask_path, unwrap_frames, resample_to_cartesian, voxel_mm=0.30, verbose=verbose)
+    
+    print("[theta_k] min/max:", float(theta_k.min()), float(theta_k.max()))
+    print("[theta_k] any non-increasing:", bool(np.any(np.diff(theta_k) <= 0)))
+    print("[theta_k] max span (rad):", float(theta_k.max() - theta_k.min()))
 
     # Geometry is now centralized in geom object - use it everywhere
     with timer("Resample to 3D Cartesian", verbose):
