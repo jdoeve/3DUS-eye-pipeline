@@ -23,6 +23,7 @@ matplotlib.use('Agg')  # headless for launchers
 import matplotlib.pyplot as plt
 import SimpleITK as sitk
 from scipy.ndimage import map_coordinates, gaussian_filter1d
+from scipy.ndimage import shift as ndi_shift
 
 # ==================== CALIBRATION CONSTANTS (SINGLE SOURCE OF TRUTH) ====================
 # Device specifications - Eye Cubed 10MHz posterior mode
@@ -147,9 +148,17 @@ def microsearch_apex(unwrapped_builder, imgs, geom_seed, mask_path: Path,
                 v = float(np.var(radii))
                 if v < best["var"]:
                     best = {"var": v, "apex": apx, "geom": geom}
+ 
+    if best["var"] == np.inf:
+        if verbose:
+            print("[APEX-QA] WARNING: microsearch found no valid candidates (best var=inf). "
+                  "Falling back to seed apex.")
+        return geom_seed
+    
     if verbose:
         print(f"[APEX-QA] chosen apex {best['apex']} with var={best['var']:.6f}")
     return best["geom"]
+
 
 def pca_axis_ratio_of_volume(vol: np.ndarray, thresh_frac=0.6) -> float:
     """Calculate PCA axis ratio of volume for QC."""
@@ -309,11 +318,19 @@ def find_best_cut(unwrapped: np.ndarray, geom,
 
     return best_k, float(best_score)
 
-def apply_circular_shift_best_cut(unwrapped: np.ndarray, theta_k: np.ndarray, phi_shifts: np.ndarray, k: int, theta_span_rad: float, verbose: bool = True):
+
+def apply_circular_shift_best_cut(unwrapped: np.ndarray,
+                                  theta_k: np.ndarray,
+                                  phi_shifts: np.ndarray,
+                                  drifts_r: np.ndarray,
+                                  drifts_phi: np.ndarray,
+                                  k: int,
+                                  theta_span_rad: float,
+                                  verbose: bool = True):
     if k == 0:
         if verbose:
             print("[best-cut] k=0, no circular shift applied.")
-        return unwrapped, theta_k.astype(np.float32, copy=False), phi_shifts.astype(np.int32, copy=False)
+        return (unwrapped, theta_k.astype(np.float32, copy=False), phi_shifts.astype(np.int32, copy=False), drifts_r.astype(np.float32, copy=False), drifts_phi.astype(np.float32, copy=False))
 
     if verbose:
         print(f"[best-cut] Applying circular shift by {-k} (cut at k={k}).")
@@ -322,36 +339,44 @@ def apply_circular_shift_best_cut(unwrapped: np.ndarray, theta_k: np.ndarray, ph
     theta2     = np.roll(theta_k,  shift=-k).astype(np.float64)   # do unwrap in float64
     phi2       = np.roll(phi_shifts, shift=-k).astype(np.int32)
 
-    # 1) unwrap → strictly increasing in continuous radians
+    drifts_r2   = np.roll(drifts_r,   shift=-k).astype(np.float32)
+    drifts_phi2 = np.roll(drifts_phi, shift=-k).astype(np.float32)
+
+    # ================= FIX: make theta2 strictly increasing and span [0, theta_span_rad) =================
+
+    # 1) unwrap angular discontinuity (removes 2π → 0 jump)
     theta2 = np.unwrap(theta2)
 
-    # 2) normalize to start at 0
-    theta2 -= theta2.min()
+    # 2) shift so theta starts at 0
+    theta2 -= float(theta2.min())
 
-    # 3) scale to exactly [0, theta_span_rad]
+    # 3) rescale to exact requested span
     span = float(theta2.max() - theta2.min())
     if span < 1e-6:
-        # fallback: uniform theta if something went wrong
         if verbose:
-            print("[best-cut] WARNING: theta span collapsed; falling back to uniform theta grid.")
+            print("[best-cut] WARNING: theta span collapsed; falling back to uniform grid.")
         N = theta2.size
         theta2 = np.linspace(0.0, theta_span_rad, N, endpoint=False, dtype=np.float64)
     else:
         theta2 *= (float(theta_span_rad) / span)
 
-    # 4) final strict monotonic safety (float32 can introduce equal neighbors)
+    # 4) enforce strict monotonicity (float32 safety)
     theta2 = theta2.astype(np.float32)
     eps = 1e-6
     for i in range(1, theta2.size):
-        if theta2[i] <= theta2[i-1]:
-            theta2[i] = theta2[i-1] + eps
+        if theta2[i] <= theta2[i - 1]:
+            theta2[i] = theta2[i - 1] + eps
 
     if verbose:
-        print(f"[best-cut] theta_k after unwrap: min={float(theta2.min()):.6f} "
-              f"max={float(theta2.max()):.6f} span={float(theta2.max()-theta2.min()):.6f} "
-              f"noninc={bool(np.any(np.diff(theta2) <= 0))}")
+        print(
+        f"[best-cut] theta_k after fix: "
+        f"min={theta2.min():.6f} "
+        f"max={theta2.max():.6f} "
+        f"span={theta2.max() - theta2.min():.6f} "
+        f"noninc={np.any(np.diff(theta2) <= 0)}"
+    )
 
-    return unwrapped2, theta2, phi2
+    return unwrapped2, theta2, phi2, drifts_r2, drifts_phi2
 
 def closure_blend(unwrapped: np.ndarray, K: int = 5, verbose=True) -> np.ndarray:
     """
@@ -381,6 +406,14 @@ def closure_blend(unwrapped: np.ndarray, K: int = 5, verbose=True) -> np.ndarray
     if verbose:
         print(f"[blend] Applied closure blend with K={K}.")
     return out
+
+def enforce_strictly_increasing(tk: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    tk = tk.astype(np.float32, copy=True)
+    for i in range(1, tk.size):
+        if tk[i] <= tk[i-1]:
+            tk[i] = tk[i-1] + eps
+    return tk
+
 
 # ==================== GEOMETRY CONFIGURATION (SINGLE SOURCE OF TRUTH) ====================
 class GeometryConfig:
@@ -811,33 +844,153 @@ def estimate_phi_shift_1d(ref_uw, mov_uw):
         k -= 2 * n
     return k
 
-def register_frames(unwrapped, verbose: bool = True):
+def _phase_corr_shift_2d(A: np.ndarray, B: np.ndarray, eps: float = 1e-8):
     """
-    Rigidly register unwrapped frames along the φ axis to a mid-frame reference.
+    Estimate translation (dr, dphi) that best aligns B to A using phase correlation.
+    Returns subpixel shift in (r, phi) coordinates as floats:
+      shift_r, shift_phi
+    """
+    A = A.astype(np.float32, copy=False)
+    B = B.astype(np.float32, copy=False)
+
+    # Remove DC to reduce bias from large uniform regions
+    A0 = A - np.mean(A)
+    B0 = B - np.mean(B)
+
+    FA = np.fft.fft2(A0)
+    FB = np.fft.fft2(B0)
+    R = FA * np.conj(FB)
+    R /= (np.abs(R) + eps)
+
+    cc = np.fft.ifft2(R)
+    cc = np.abs(cc)
+
+    # Peak gives integer shift in wrapped coordinates
+    r0, c0 = np.unravel_index(np.argmax(cc), cc.shape)
+    Nr, Np = cc.shape
+
+    # Convert wrapped peak to signed shift
+    if r0 > Nr // 2:
+        r0 -= Nr
+    if c0 > Np // 2:
+        c0 -= Np
+
+    # Optional: crude subpixel refinement (parabolic) around peak
+    # (Good enough for now; you can upgrade later)
+    def parabolic(fm1, f0, fp1):
+        denom = (fm1 - 2*f0 + fp1)
+        if abs(denom) < 1e-12:
+            return 0.0
+        return 0.5 * (fm1 - fp1) / denom
+
+    # guard edges
+    rr = r0 % Nr
+    cc0 = c0 % Np
+
+    # refine in r
+    rm1 = cc[(rr-1) % Nr, cc0]
+    r00 = cc[rr, cc0]
+    rp1 = cc[(rr+1) % Nr, cc0]
+    dr_sub = parabolic(rm1, r00, rp1)
+
+    # refine in phi
+    cm1 = cc[rr, (cc0-1) % Np]
+    c00 = cc[rr, cc0]
+    cp1 = cc[rr, (cc0+1) % Np]
+    dphi_sub = parabolic(cm1, c00, cp1)
+
+    shift_r   = float(r0 + dr_sub)
+    shift_phi = float(c0 + dphi_sub)
+    return shift_r, shift_phi
+
+
+def register_frames_level1(unwrapped: np.ndarray,
+                           verbose: bool = True,
+                           use_roi: bool = True,
+                           roi_r_frac=(0.20, 0.90),
+                           roi_phi_frac=(0.05, 0.95),
+                           apply_subpixel: bool = True):
+    """
+    Level-1 motion correction in unwrapped (r,phi) space:
+    estimate per-frame (Δr, Δφ) relative to a mid-frame reference.
+
+    - Δφ is circular (wrap) -> roll or wrap-shift
+    - Δr is not circular -> shifted with edge-fill
 
     Returns
     -------
-    unwrapped_reg : np.ndarray
-        Registered unwrapped stack, same shape as input.
-    phi_shifts : np.ndarray of shape (N,)
-        Integer pixel shifts applied to each frame (φ-direction).
-        Positive shift means the frame was rolled forward along +φ.
+    unwrapped_reg : np.ndarray, same shape as input
+    drifts_r      : (N,) float32  (positive means frame shifted toward +r to match ref)
+    drifts_phi    : (N,) float32  (positive means frame shifted toward +phi to match ref)
     """
-    N = unwrapped.shape[0]
-    ref = unwrapped[N // 2]
-    phi_shifts = np.zeros(N, dtype=np.int32)
+    unwrapped = np.asarray(unwrapped, dtype=np.float32)
+    N, R, P = unwrapped.shape
+    ref_idx = N // 2
+    ref = unwrapped[ref_idx]
+
+    # Choose a stable ROI: avoid apex/noisy edges and fan boundaries
+    if use_roi:
+        r0 = int(roi_r_frac[0] * R); r1 = int(roi_r_frac[1] * R)
+        p0 = int(roi_phi_frac[0] * P); p1 = int(roi_phi_frac[1] * P)
+        ref_roi = ref[r0:r1, p0:p1]
+    else:
+        r0, r1, p0, p1 = 0, R, 0, P
+        ref_roi = ref
+
+    drifts_r = np.zeros(N, dtype=np.float32)
+    drifts_phi = np.zeros(N, dtype=np.float32)
+    out = unwrapped.copy()
 
     for k in range(N):
-        sh = estimate_phi_shift_1d(ref, unwrapped[k])
-        phi_shifts[k] = sh
-        if sh:
-            unwrapped[k] = np.roll(unwrapped[k], shift=sh, axis=1)
+        mov = unwrapped[k]
+        mov_roi = mov[r0:r1, p0:p1]
+
+        sh_r, sh_phi = _phase_corr_shift_2d(ref_roi, mov_roi)
+
+        # If you want integer-only for stability, uncomment:
+        # sh_r = float(np.round(sh_r))
+        # sh_phi = float(np.round(sh_phi))
+
+        drifts_r[k] = sh_r
+        drifts_phi[k] = sh_phi
+
+        # Apply correction to the FULL frame:
+        # 1) φ is periodic -> roll by nearest int, then (optional) subpixel wrap shift
+        # 2) r is non-periodic -> ndimage.shift with edge fill
+
+        # integer φ roll first (fast, exact wrap)
+        phi_int = int(np.round(sh_phi))
+        tmp = np.roll(mov, shift=phi_int, axis=1)
+
+        # remaining subpixel φ correction (optional)
+        phi_frac = float(sh_phi - phi_int)
+        if apply_subpixel and abs(phi_frac) > 1e-3:
+            # subpixel shift in phi with wrap: do it via Fourier shift on axis=1
+            # simplest: ndimage.shift with mode='wrap' on axis=1 only
+            tmp = ndi_shift(tmp, shift=(0.0, phi_frac), order=1, mode='wrap', prefilter=False)
+
+        # apply r shift (non-wrap). Use constant/nearest to avoid ringing.
+        if apply_subpixel and abs(sh_r) > 1e-3:
+            tmp = ndi_shift(tmp, shift=(sh_r, 0.0), order=1, mode='nearest', prefilter=False)
+        else:
+            r_int = int(np.round(sh_r))
+            if r_int != 0:
+                tmp = ndi_shift(tmp, shift=(float(r_int), 0.0), order=0, mode='nearest', prefilter=False)
+
+        out[k] = tmp
 
     if verbose:
-        print(f"Registered {N} frames to mid-frame reference")
-        print(f"[register] φ-shift range: {phi_shifts.min()}..{phi_shifts.max()} px")
+        print(f"Registered {N} frames to mid-frame reference (Level-1: Δr + Δφ)")
+        print(f"[register] Δφ range: {drifts_phi.min():.2f}..{drifts_phi.max():.2f} px")
+        print(f"[register] Δr  range: {drifts_r.min():.2f}..{drifts_r.max():.2f} px")
 
-    return unwrapped, phi_shifts
+        # Closure mismatch diagnostic (how far end is from start after correction)
+        # This is the “why seam exists” number.
+        print(f"[register] closure Δφ (end-start): {float(drifts_phi[-1]-drifts_phi[0]):.2f} px")
+        print(f"[register] closure Δr  (end-start): {float(drifts_r[-1]-drifts_r[0]):.2f} px")
+
+    return out, drifts_r, drifts_phi
+
 
 # ==================== RESAMPLING (polar to Cartesian 3D) ====================
 def resample_to_cartesian(unwrapped,
@@ -848,6 +1001,7 @@ def resample_to_cartesian(unwrapped,
                           interp_order: int,
                           slab_size: int,
                           theta_k=None,
+                          theta_pad: int | None = None,
                           verbose: bool = True):
   
     """
@@ -903,10 +1057,6 @@ def resample_to_cartesian(unwrapped,
     frame_idx_array = np.arange(Ntheta, dtype=np.float32)
     theta_span_rad_eff = max(theta_max - theta_min, 1e-6)
 
-    print("theta_k last 5:", theta_k[-5:])
-    print("diff last 5:", np.diff(theta_k[-5:]))
-    print("any non-increasing:", np.any(np.diff(theta_k) <= 0))
-
     # ==== DEBUG PHANTOMS: enable ONE at a time ====
     if DEBUG_THETA_PHANTOM:
         # Periodic theta phantom: intensity = (cos(theta)+1)/2
@@ -922,16 +1072,43 @@ def resample_to_cartesian(unwrapped,
         for i in range(Rn):
             V[i, :, :] = float(i)
     # ===============================================
+    # ---- Patch 2 (REPLACEMENT): make theta periodic for interpolation (wrap padding) ----
+    # Interpolation near the seam needs neighbors on BOTH sides.
+    # PAD=1 is usually enough for linear; PAD=2+ is needed for cubic/spline-ish behavior.
+    if theta_pad is None:
+        PAD = 2 if interp_order >= 3 else 1
+    else:
+        PAD = int(theta_pad)
 
-    # ---- Patch 2: make theta periodic for interpolation (close the loop) ----
-    # Add a duplicate of theta=0 as the last theta slice so 2π blends with 0.
-    V = np.concatenate([V, V[:, :, 0:1]], axis=2)
-    Rn, Wang_v, Ntheta = V.shape  # Ntheta is now original+1
-    # ------------------------------------------------------------------------
+    # Keep a copy of original Ntheta before padding
+    Ntheta0 = Ntheta
 
-    # Make theta_k and frame_idx_array match the new theta length (Ntheta = Norig+1)
-    theta_k = np.concatenate([theta_k, [theta_k[0] + theta_span_rad_eff]]).astype(np.float32)
+    # Pad V on both ends along theta (axis=2): [... last PAD] + [all] + [first PAD]
+    V = np.concatenate([V[:, :, -PAD:], V, V[:, :, :PAD]], axis=2).astype(np.float32)
+    V = np.ascontiguousarray(V, dtype=np.float32)
+
+    # Pad theta_k consistently so it remains strictly increasing and spans beyond [0, 2π)
+    # theta_span_rad_eff is computed just below from theta_min/theta_max; we need it here,
+    # so ensure theta_span_rad_eff is defined before this block (see note below).
+    theta_k = theta_k.astype(np.float32, copy=False)
+    theta_k_pad = np.concatenate([
+        theta_k[-PAD:] - theta_span_rad_eff,
+        theta_k,
+        theta_k[:PAD] + theta_span_rad_eff
+        ]).astype(np.float32)
+
+    # Update Ntheta and frame index array to match padded V
+    Rn, Wang_v, Ntheta = V.shape
     frame_idx_array = np.arange(Ntheta, dtype=np.float32)
+
+    # Overwrite theta_k used downstream to be the padded one
+    theta_k = theta_k_pad
+
+    theta_k_min = float(theta_k[0])
+    theta_k_max = float(theta_k[-1])
+    # -------------------------------------------------------------------------------
+
+    print(f"[theta_k padded] min={theta_k_min:.6f} max={theta_k_max:.6f} Ntheta={Ntheta} PAD={PAD}")
 
     sigma_theta = 0.0  # default (no smoothing)
     did_smooth = False
@@ -966,10 +1143,6 @@ def resample_to_cartesian(unwrapped,
     rho2d = np.sqrt(Y2**2 + Z2**2).astype(np.float32)          # (Ny, Nz)
     psi2d = np.arctan2(Z2, Y2).astype(np.float32)              # (Ny, Nz)
     psi2d = np.mod(psi2d, 2*np.pi).astype(np.float32)          # [0, 2π)
-
-    # --- NEW: rotate branch cut away from voxel grid (half-bin offset) ---
-    psi_offset = np.pi/2
-    psi2d = np.mod(psi2d + psi_offset, 2*np.pi).astype(np.float32)
 
     vol = np.zeros((Nx, Ny, Nz), dtype=np.float32)
     n_slabs = int(np.ceil(Nx / slab_size))
@@ -1039,6 +1212,8 @@ def resample_to_cartesian(unwrapped,
             psi_v = psi2d[idx_valid[1], idx_valid[2]]  # depends only on (y,z)
             theta_virtual_v = (psi_v / (2*np.pi)) * theta_span_rad_eff + theta_min
             theta_virtual_v = theta_virtual_v.astype(np.float32, copy=False)
+            theta_virtual_v = np.clip(theta_virtual_v, theta_k_min, theta_k_max)
+
 
             # Interpolate global angle to fractional frame index
             theta_idx_v = np.interp(theta_virtual_v, theta_k, frame_idx_array)
@@ -1387,25 +1562,14 @@ def run_pipeline(img_dir: Path,
         endpoint=False,   # <<< CRITICAL FIX
         dtype=np.float32)
 
-
     if do_registration:
         with timer("Register φ across frames", verbose):
-            unwrapped, phi_shifts = register_frames(unwrapped, verbose=verbose)
-
-        # Convert φ pixel shifts to small angular corrections in θ (radians).
-        # Each φ pixel corresponds to Δφ radians; rolling the image by +sh pixels
-        # means the original frame was rotated by about -sh * Δφ.
-        dphi = geom.delta_phi_per_px  # rad/px along φ
-        delta_theta = -phi_shifts.astype(np.float32) * dphi
-
-        theta_k = theta_k + delta_theta
-
-        # Renormalize θ_k back to [0, theta_span_rad] while preserving ordering.
-        theta_k -= theta_k.min()
-        max_span = max(theta_k.max(), 1e-6)
-        theta_k *= theta_span_rad / max_span
+            unwrapped, drifts_r, drifts_phi = register_frames_level1(unwrapped, verbose=verbose)
+            phi_shifts = np.round(drifts_phi).astype(np.int32)
     else:
-        phi_shifts = np.zeros(Ntheta, dtype=np.int32)
+        drifts_r   = np.zeros(unwrapped.shape[0], dtype=np.float32)
+        drifts_phi = np.zeros(unwrapped.shape[0], dtype=np.float32)
+        phi_shifts = np.zeros(unwrapped.shape[0], dtype=np.int32) 
 
     # ==================== SEAM ROBUSTNESS (REAL DATA) ====================
     ENABLE_BEST_CUT_SHIFT = True
@@ -1427,10 +1591,60 @@ def run_pipeline(img_dir: Path,
         )
         if verbose:
             print(f"[seam] best cut k={k_cut} with adjacent corr={k_score:.4f}")
+        
+        unwrapped, theta_k, phi_shifts, drifts_r, drifts_phi = apply_circular_shift_best_cut(unwrapped, theta_k, phi_shifts, drifts_r, drifts_phi, k_cut, theta_span_rad, verbose=verbose)
 
-        unwrapped, theta_k, phi_shifts = apply_circular_shift_best_cut(
-            unwrapped, theta_k, phi_shifts, k_cut, theta_span_rad, verbose=verbose
-            )
+    # -------- Level-1 closure enforcement (remove linear drift ramp) --------
+    # Do this AFTER best-cut (so "start" and "end" correspond to the chosen seam)
+    if do_registration:
+        Ntheta = unwrapped.shape[0]
+        t = np.linspace(0.0, 1.0, Ntheta, dtype=np.float32)
+
+        drifts_phi_corr = drifts_phi - (drifts_phi[0] + (drifts_phi[-1] - drifts_phi[0]) * t)
+        drifts_r_corr   = drifts_r   - (drifts_r[0]   + (drifts_r[-1]   - drifts_r[0])   * t)
+
+        extra_phi = (drifts_phi_corr - drifts_phi).astype(np.float32)
+        extra_r   = (drifts_r_corr   - drifts_r).astype(np.float32)
+
+        for k in range(Ntheta):
+            phi_int = int(np.round(extra_phi[k]))
+            tmp = np.roll(unwrapped[k], shift=phi_int, axis=1)
+
+            phi_frac = float(extra_phi[k] - phi_int)
+            if abs(phi_frac) > 1e-3:
+                tmp = ndi_shift(tmp, shift=(0.0, phi_frac), order=1, mode='wrap', prefilter=False)
+
+            r_shift = float(extra_r[k])
+            if abs(r_shift) > 1e-3:
+                tmp = ndi_shift(tmp, shift=(r_shift, 0.0), order=1, mode='nearest', prefilter=False)
+
+            unwrapped[k] = tmp
+
+        drifts_phi = drifts_phi_corr
+        drifts_r   = drifts_r_corr
+
+        if verbose:
+            print(f"[closure] enforced closure: Δφ(end-start)={float(drifts_phi[-1]-drifts_phi[0]):.3f}px, "
+                  f"Δr(end-start)={float(drifts_r[-1]-drifts_r[0]):.3f}px")
+    
+    # --- rebuild theta_k from scratch using FINAL drifts_phi ---
+    Ntheta = unwrapped.shape[0]
+    theta_base = np.linspace(0.0, theta_span_rad, Ntheta, endpoint=False, dtype=np.float32)
+
+    if do_registration:
+        phi_shifts = np.round(drifts_phi).astype(np.int32)
+    else:
+        phi_shifts = np.zeros(Ntheta, dtype=np.int32)
+
+    dphi = geom.delta_phi_per_px
+    delta_theta = -phi_shifts.astype(np.float32) * dphi
+
+    theta_k = theta_base + delta_theta
+
+    # normalize ONCE
+    theta_k -= theta_k.min()
+    theta_k *= theta_span_rad / max(theta_k.max(), 1e-6)
+    theta_k = enforce_strictly_increasing(theta_k)
 
     if ENABLE_CLOSURE_BLEND:
         unwrapped = closure_blend(unwrapped, K=BLEND_K, verbose=verbose)

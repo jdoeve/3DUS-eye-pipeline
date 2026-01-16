@@ -14,6 +14,25 @@ GEO_RADIUS_MM   = 10.0          # initial guess / used only if PATCH_MODE!="geod
 POSTERIOR_ANGLE_DEG = 45.0      # if PATCH_MODE="angle"
 PLANE_D_MM      = 3.0           # if PATCH_MODE="plane"
 
+# --- Robust Apex Options (recommended ON) ---
+
+# 0) Manual override (best fail-safe):
+# Create a Markups fiducial named MANUAL_APEX_FIDUCIAL_NAME (1 point).
+# Script will snap it to nearest surface vertex and use that as apex.
+USE_MANUAL_APEX_FIDUCIAL   = True
+MANUAL_APEX_FIDUCIAL_NAME  = "PosteriorApex_Manual"
+USE_BOUNDARY_DISTANCE_APEX = True
+
+# 1) Posterior prior direction (surface-only). Helps prevent picking seams/rims.
+USE_POSTERIOR_PRIOR        = True
+POSTERIOR_PRIOR_CONE_DEG   = 35.0   # coarse cone around posterior prior
+
+# 2) Residual smoothing on mesh (median over 1-ring neighbors).
+USE_RESIDUAL_MEDIAN_SMOOTH = True
+
+# 3) Optional second refinement cone around the coarse apex (you already have this)
+# POSTERIOR_CONE_DEG is reused for the final refine stage
+
 # ----- Variance reduction / standardization options -----
 
 # 1) Apex refinement: only search for apex within this cone around initial apex direction
@@ -393,6 +412,161 @@ def _create_or_update_apex_fiducial(point_ras, name):
     node.SetLocked(True)  # avoid accidental edits
     return node
 
+def _get_fiducial_point_world(name):
+    """Return first control point world coords from a Markups fiducial node, or None."""
+    try:
+        n = slicer.util.getNode(name)
+    except Exception:
+        return None
+    if n is None or n.GetClassName() != "vtkMRMLMarkupsFiducialNode":
+        return None
+    if n.GetNumberOfControlPoints() < 1:
+        return None
+    p = [0.0, 0.0, 0.0]
+    n.GetNthControlPointPositionWorld(0, p)
+    return np.array(p, dtype=float)
+
+def _nearest_vertex_index(P, point):
+    d = np.linalg.norm(P - point[None, :], axis=1)
+    return int(np.argmin(d))
+
+def _pca_axis(P):
+    """Return first principal component unit vector from points P (Nx3)."""
+    X = P - np.mean(P, axis=0, keepdims=True)
+    C = (X.T @ X) / max(len(P) - 1, 1)
+    w, V = np.linalg.eigh(C)
+    a = V[:, np.argmax(w)]
+    a = a / (np.linalg.norm(a) + 1e-12)
+    return a
+
+def _choose_posterior_prior_dir(P, c, resid, cone_deg=35.0, apex_mode="interior"):
+    """
+    Surface-only posterior prior:
+    - Use PCA main axis (±a)
+    - Choose the sign whose cone contains 'deeper' residuals for interior (or higher for exterior).
+    """
+    a = _pca_axis(P)
+    c = np.asarray(c, dtype=float)
+
+    # unit directions from center
+    V = P - c[None, :]
+    Vn = np.linalg.norm(V, axis=1)
+    Vn[Vn < 1e-9] = 1e-9
+    U = V / Vn[:, None]
+
+    def score_for_dir(d):
+        d = d / (np.linalg.norm(d) + 1e-12)
+        cos_thresh = np.cos(np.deg2rad(cone_deg))
+        m = (U @ d) >= cos_thresh
+        if not np.any(m):
+            return np.inf if apex_mode == "interior" else -np.inf
+        r = resid[m]
+        # robust statistic (median)
+        return float(np.median(r))
+
+    s_pos = score_for_dir(a)
+    s_neg = score_for_dir(-a)
+
+    if apex_mode == "interior":
+        # want more negative median residual (deeper cup)
+        return a if s_pos < s_neg else -a
+    else:
+        # want more positive median residual (bigger bulge)
+        return a if s_pos > s_neg else -a
+
+def _median_smooth_scalar_on_mesh(poly, values):
+    """
+    1-ring median smoothing of a scalar defined per-vertex.
+    Excellent for killing seam spikes that hijack argmin/argmax.
+    """
+    P = _vtk_to_numpy_points(poly)
+    adj = _build_edge_graph(poly, P)  # list of (neighbor, weight)
+    vals = np.asarray(values, dtype=float)
+    out = np.empty_like(vals)
+    for i in range(len(adj)):
+        nbrs = [i] + [j for (j, _) in adj[i]]
+        out[i] = float(np.median(vals[nbrs]))
+    return out
+
+def _pick_apex_with_prior(P, c, resid, apex_mode, prior_dir, prior_cone_deg):
+    """Pick apex index within a cone around prior_dir using resid (already smoothed if desired)."""
+    c = np.asarray(c, dtype=float)
+    prior_dir = np.asarray(prior_dir, dtype=float)
+    prior_dir = prior_dir / (np.linalg.norm(prior_dir) + 1e-12)
+
+    V = P - c[None, :]
+    Vn = np.linalg.norm(V, axis=1)
+    Vn[Vn < 1e-9] = 1e-9
+    U = V / Vn[:, None]
+
+    cos_thresh = np.cos(np.deg2rad(prior_cone_deg))
+    m = (U @ prior_dir) >= cos_thresh
+    if not np.any(m):
+        m = np.ones(P.shape[0], dtype=bool)
+
+    idxs = np.arange(P.shape[0])[m]
+    r = resid[m]
+
+    if apex_mode == "interior":
+        best = int(idxs[np.argmin(r)])
+    else:
+        best = int(idxs[np.argmax(r)])
+    return best
+
+def _boundary_vertex_mask(poly):
+    """Return boolean mask of vertices that lie on the mesh boundary (edges used by only 1 face)."""
+    n = poly.GetNumberOfPoints()
+    boundary = np.zeros(n, dtype=bool)
+
+    edgeCount = {}
+    polys = poly.GetPolys(); polys.InitTraversal()
+    idList = vtk.vtkIdList()
+    while polys.GetNextCell(idList):
+        ids = [idList.GetId(i) for i in range(idList.GetNumberOfIds())]
+        for i in range(len(ids)):
+            a = ids[i]
+            b = ids[(i+1) % len(ids)]
+            if a > b: a, b = b, a
+            edgeCount[(a, b)] = edgeCount.get((a, b), 0) + 1
+
+    for (a, b), cnt in edgeCount.items():
+        if cnt == 1:
+            boundary[a] = True
+            boundary[b] = True
+    return boundary
+
+def _multi_source_geodesic(poly, points, seed_mask):
+    """Dijkstra from many seeds at once. seed_mask True means distance=0 start."""
+    adj = _build_edge_graph(poly, points)
+    n = len(adj)
+    dist = np.full(n, np.inf, dtype=np.float64)
+    h = []
+    for i, s in enumerate(seed_mask):
+        if s:
+            dist[i] = 0.0
+            h.append((0.0, i))
+    heapq.heapify(h)
+    visited = np.zeros(n, dtype=bool)
+
+    while h:
+        d,u = heapq.heappop(h)
+        if visited[u]: 
+            continue
+        visited[u] = True
+        for v,w in adj[u]:
+            nd = d + w
+            if nd < dist[v]:
+                dist[v] = nd
+                heapq.heappush(h, (nd, v))
+    return dist
+
+def _pseudo_boundary_from_radius(P, c, top_percent=5.0):
+    """Return seed mask selecting the outermost top_percent of ||P-c|| as a pseudo-boundary."""
+    r = np.linalg.norm(P - c[None, :], axis=1)
+    thr = np.percentile(r, 100.0 - top_percent)
+    return r >= thr
+
+
 # ===================== Variance Reduction Helpers =====================
 
 def _smooth_poly(poly):
@@ -490,38 +664,88 @@ def run_pipeline():
     P = _vtk_to_numpy_points(poly)
     c0, R0 = _robust_sphere_fit(P, trim_frac=TRIM_FRAC, iters=TRIM_ITERS)
 
-    # 3) Residuals and apex (interior vs exterior)
+    # 3) Residuals (BFS)
     dist0  = np.linalg.norm(P - c0, axis=1)
     resid0 = dist0 - R0
-    apex_idx = int(np.argmin(resid0)) if APEX_MODE == "interior" else int(np.argmax(resid0))
+
+    # -------------------- Apex selection (priority order) --------------------
+    apex_fiducial = None  # avoids "referenced before assignment"
+
+    # (1) Manual apex override (highest priority)
+    manual_world = _get_fiducial_point_world(MANUAL_APEX_FIDUCIAL_NAME) if USE_MANUAL_APEX_FIDUCIAL else None
+    if manual_world is not None:
+        apex_idx = _nearest_vertex_index(P, manual_world)
+        apex_reason = "manual_fiducial"
+
+    # (2) Boundary-distance apex (geodesic farthest from boundary)
+    elif USE_BOUNDARY_DISTANCE_APEX:
+        bmask = _boundary_vertex_mask(poly)
+
+        # If the surface is closed, there is no true boundary → use a pseudo-boundary ring
+        if np.count_nonzero(bmask) < 10:
+            bmask = _pseudo_boundary_from_radius(P, c0, top_percent=5.0)
+
+        db = _multi_source_geodesic(poly, P, bmask)  # distance-to-boundary (mm)
+
+        # Restrict to correct side of BFS if possible
+        if APEX_MODE == "interior":
+            valid = np.isfinite(db) & (resid0 <= 0.0 + 1e-6)
+        else:
+            valid = np.isfinite(db) & (resid0 >= 0.0 - 1e-6)
+
+        if np.count_nonzero(valid) < 50:
+            valid = np.isfinite(db)
+
+        idxs = np.where(valid)[0]
+        if idxs.size == 0:
+            raise RuntimeError("Boundary-distance apex failed: no finite distance-to-boundary values.")
+
+        apex_idx = int(idxs[np.argmax(db[idxs])])
+        apex_reason = "boundary_distance"
+
+    # (3) Fallback: posterior prior + median-smoothed residual minimum/maximum
+    else:
+        # choose posterior hemisphere using PCA prior (or residual-extremum direction if disabled)
+        if USE_POSTERIOR_PRIOR:
+            prior_dir = _choose_posterior_prior_dir(
+                P=P, c=c0, resid=resid0, cone_deg=POSTERIOR_PRIOR_CONE_DEG, apex_mode=APEX_MODE
+            )
+        else:
+            tmp_idx = int(np.argmin(resid0)) if APEX_MODE == "interior" else int(np.argmax(resid0))
+            prior_dir = (P[tmp_idx] - c0)
+
+        resid_for_pick = _median_smooth_scalar_on_mesh(poly, resid0) if USE_RESIDUAL_MEDIAN_SMOOTH else resid0
+
+        apex_idx = _pick_apex_with_prior(
+            P=P, c=c0, resid=resid_for_pick, apex_mode=APEX_MODE,
+            prior_dir=prior_dir, prior_cone_deg=POSTERIOR_PRIOR_CONE_DEG
+        )
+        apex_reason = "prior_residual"
+
+    # Initial apex point + direction
     apex_point = P[apex_idx]
     apex_dir   = apex_point - c0
-    apex_fiducial = _create_or_update_apex_fiducial(apex_point, APEX_FIDUCIAL_NAME) if CREATE_APEX_FIDUCIAL else None
 
-    # --- Global residuals for all vertices (for apex refinement etc.) ---
-    r_all = np.linalg.norm(P - c0[None, :], axis=1)
-    resid_all = r_all - R0
-
-
-    # --- Apex refinement in cone around initial direction (variance reduction step 1) ---
-    # apex_point currently comes from your existing method (deepest point, etc.)
-    apex_point, apex_index = _refine_apex_in_cone(
+    # -------------------- Optional refinement (narrow cone) --------------------
+    # Refine using raw residuals (not smoothed) within a tighter cone around the initial apex direction
+    apex_point, apex_idx = _refine_apex_in_cone(
         P=P,
         c=c0,
         apex_point=apex_point,
-        resid_all=resid_all,
+        resid_all=resid0,
         apex_mode=APEX_MODE,
         cone_deg=POSTERIOR_CONE_DEG
     )
-
-    # If later code uses apex_index, you can propagate it; otherwise apex_point is enough.
-    # Update index and direction to use refined apex for downstream steps
-    apex_idx = apex_index
     apex_dir = apex_point - c0
 
-    # Optionally update the fiducial to the refined apex
+    # Create/update fiducial at FINAL apex
     if CREATE_APEX_FIDUCIAL:
         apex_fiducial = _create_or_update_apex_fiducial(apex_point, APEX_FIDUCIAL_NAME)
+
+    # (Optional) Debug prints
+    print(f"[Apex] method={apex_reason}  idx={apex_idx}  resid0={resid0[apex_idx]:.3f} mm")
+    if USE_BOUNDARY_DISTANCE_APEX and 'db' in locals():
+        print(f"[Apex] db (dist-to-boundary)={db[apex_idx]:.3f} mm")
 
     # 4) Build the analysis patch
     if PATCH_MODE == "geodesic":
@@ -621,7 +845,6 @@ def run_pipeline():
         local_radius_mm=LOCAL_QUADRIC_RADIUS_MM,
         outlier_trim_frac=LOCAL_QUADRIC_TRIM_FRAC     # <-- stronger trimming (step 4)
     )
-
 
     # 6b) Discrete mean curvature on the full surface, summarized on patch
     H_all = _compute_discrete_mean_curvature(poly)   # one H value per vertex
