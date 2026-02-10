@@ -1,0 +1,27 @@
+"""Configuration constants for the UC-Eye pipeline."""
+
+import numpy as np
+
+# Device specifications - Eye Cubed 10MHz posterior mode
+EYE_CUBED_DEPTH_MM = 48.0
+EYE_CUBED_FAN_ANGLE_DEG = 52.0
+SOS_SCALE = 1
+
+# Derived values
+EFFECTIVE_DEPTH_MM = EYE_CUBED_DEPTH_MM * SOS_SCALE
+FAN_ANGLE_RAD = np.deg2rad(EYE_CUBED_FAN_ANGLE_DEG)
+
+DEFAULT_DEPTH_MM = EYE_CUBED_DEPTH_MM
+DEFAULT_VOXEL_MM = 0.20
+DEFAULT_SIGMA_THETA_DEG = 0.0
+DEFAULT_INTERP_ORDER = 1
+DEFAULT_SLAB_SIZE = 48
+DEFAULT_THETA_SPAN_DEG = 360.0
+
+# Debug flags
+DEBUG_THETA_PHANTOM = False
+DEBUG_PHI_PHANTOM = False
+DEBUG_RADIAL_PHANTOM = False
+DEBUG_BYPASS_MASK = False
+DEBUG_DUMP_MASK = False
+DO_QC = False

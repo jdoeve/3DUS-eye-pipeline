@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "uceye"
+version = "0.1.0"
+description = "UC-Eye radial ultrasound reconstruction pipeline"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.21.0",
+  "opencv-python>=4.5.0",
+  "SimpleITK>=2.1.0",
+  "scipy>=1.7.0",
+  "imageio>=2.9.0",
+  "matplotlib>=3.3.0",
+]
+
+[project.scripts]
+run_uceye = "uceye.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

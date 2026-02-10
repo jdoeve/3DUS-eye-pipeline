@@ -8,28 +8,6 @@ echo ""
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 cd "$SCRIPT_DIR"
 
-# Find the pipeline script
-PIPELINE_SCRIPT=""
-if [ -f "uc_eye_pipeline.py" ]; then
-    PIPELINE_SCRIPT="uc_eye_pipeline.py"
-elif [ -f "uceye_pipeline.py" ]; then
-    PIPELINE_SCRIPT="uceye_pipeline.py"
-elif [ -f "pipeline.py" ]; then
-    PIPELINE_SCRIPT="pipeline.py"
-else
-    # Search for any Python file with "pipeline" in the name
-    PIPELINE_SCRIPT=$(find . -maxdepth 1 -name "*pipeline*.py" | head -n 1)
-fi
-
-if [ -z "$PIPELINE_SCRIPT" ]; then
-    echo "[ERROR] Pipeline script not found"
-    echo "Expected: uc_eye_pipeline.py, uceye_pipeline.py, or pipeline.py"
-    read -p "Press Enter to exit..."
-    exit 1
-fi
-
-echo "[OK] Found pipeline: $PIPELINE_SCRIPT"
-
 if ! command -v python3 &> /dev/null; then
     echo "[ERROR] Python3 not installed"
     read -p "Press Enter to exit..."
@@ -96,7 +74,11 @@ echo ""
 
 echo "SELECT MASK FILE"
 echo "(You can drag and drop the mask file into this window)"
-read -e -p "Mask file: " MASK_PATH_RAW
+DEFAULT_MASK_PATH="/Users/jeffreydoeve/Desktop/3DUS-Eye/cone_mask_GIMP.png"
+read -e -i "$DEFAULT_MASK_PATH" -p "Mask file [default: $DEFAULT_MASK_PATH]: " MASK_PATH_RAW
+if [ -z "$MASK_PATH_RAW" ]; then
+    MASK_PATH_RAW="$DEFAULT_MASK_PATH"
+fi
 
 # Remove quotes and whitespace, then interpret escapes
 MASK_PATH=$(echo "$MASK_PATH_RAW" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//")
@@ -128,7 +110,7 @@ echo ""
 # --depth: Physical depth in mm (Eye Cubed: 48mm for 10MHz BEFORE SoS correction)
 # --voxel: Output voxel size (default 0.20mm)
 # Fan angle locked to Eye Cubed spec: 52° (prevents mask-based errors)
-python3 "$PIPELINE_SCRIPT" \
+PYTHONPATH="$SCRIPT_DIR/uceye_package/src:$PYTHONPATH" python3 -m uceye.cli \
     --input-dir "$IMG_DIR" \
     --cone-mask "$MASK_PATH" \
     -o "$OUTPUT_NRRD" \
